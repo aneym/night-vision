@@ -1,0 +1,125 @@
+#!/bin/bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+CONFIG="${NIGHT_VISION_CONFIG:-$HOME/.config/night-vision/config.json}"
+STATE_DIR="$HOME/.local/state/night-vision"
+NSHIFT="$ROOT/bin/nshift"
+DEFAULT_CONFIG='{"display":"ddc","phases":[{"id":"day","title":"Day","symbol":"sun.max.fill","time":"07:00","lum":41,"warmth":0},{"id":"evening","title":"Evening","symbol":"sun.horizon.fill","time":"20:00","lum":32,"warmth":60},{"id":"winddown","title":"Wind-down","symbol":"moon.fill","time":"21:30","lum":20,"warmth":85},{"id":"cutoff","title":"Cutoff","symbol":"moon.zzz.fill","time":"22:15","lum":8,"warmth":100}],"lights":[{"title":"Bedroom On","shortcut":"Bedroom on"},{"title":"Living Room Low","shortcut":"Living room low"},{"title":"Hallway Low","shortcut":"Hallway Low"},{"title":"Bathroom Low","shortcut":"Bathroom low"}]}'
+mkdir -p "$STATE_DIR"
+
+config_json() {
+  if [[ -f "$CONFIG" ]] && jq -e '.display and (.phases | length > 0)' "$CONFIG" >/dev/null 2>&1; then
+    jq -c . "$CONFIG"
+  else
+    printf '%s\n' "$DEFAULT_CONFIG"
+  fi
+}
+
+config_value() { config_json | jq -r "$1"; }
+phase_value() { config_json | jq -r --arg id "$1" --arg field "$2" '.phases[] | select(.id == $id) | .[$field]'; }
+phase_exists() { config_json | jq -e --arg id "$1" '.phases[] | select(.id == $id)' >/dev/null; }
+
+lum_set() {
+  local value="$1" backend
+  backend=$(config_value '.display')
+  case "$backend" in
+    ddc) /opt/homebrew/bin/m1ddc set luminance "$value" >/dev/null ;;
+    internal) /opt/homebrew/bin/brightness "$(jq -n --argjson value "$value" '$value / 100')" >/dev/null ;;
+    *) printf 'Unsupported display backend: %s\n' "$backend" >&2; return 1 ;;
+  esac
+}
+
+lum_get() {
+  local backend output
+  backend=$(config_value '.display')
+  case "$backend" in
+    ddc)
+      output=$(/opt/homebrew/bin/m1ddc get luminance)
+      grep -Eo '[0-9]+([.][0-9]+)?' <<<"$output" | tail -1
+      ;;
+    internal)
+      output=$(/opt/homebrew/bin/brightness -l)
+      local fraction
+      fraction=$(grep -Eo 'brightness [0-9]+([.][0-9]+)?' <<<"$output" | tail -1 | cut -d' ' -f2)
+      jq -nr --arg value "$fraction" '($value | tonumber) * 100 | round'
+      ;;
+    *) printf 'Unsupported display backend: %s\n' "$backend" >&2; return 1 ;;
+  esac
+}
+
+warmth_set() {
+  if (( 10#$1 > 0 )); then "$NSHIFT" temp "$1"; else "$NSHIFT" off; fi
+}
+
+warmth_get() {
+  local output
+  output=$("$NSHIFT" status)
+  if [[ "$output" == *"enabled=yes"* ]]; then
+    grep -Eo 'strength=[0-9]+' <<<"$output" | cut -d= -f2
+  else
+    printf '0\n'
+  fi
+}
+
+is_paused() { [[ -f "$STATE_DIR/override" ]] && [[ "$(<"$STATE_DIR/override")" == "$(date +%F)" ]]; }
+notify() { /usr/bin/osascript -e "display notification \"$2\" with title \"$1\""; }
+
+run_phase() {
+  local id="$1" lum warmth title
+  phase_exists "$id" || { printf 'Unknown phase: %s\n' "$id" >&2; return 1; }
+  lum=$(phase_value "$id" lum)
+  warmth=$(phase_value "$id" warmth)
+  title=$(phase_value "$id" title)
+  warmth_set "$warmth"
+  lum_set "$lum"
+  printf '%s\n' "$id" > "$STATE_DIR/phase"
+  [[ "$id" == "day" ]] && rm -f "$STATE_DIR/override"
+  if [[ "$id" == "winddown" ]]; then notify "$title" "90 min to lights-out. Start wrapping up heavy work."; fi
+  if [[ "$id" == "cutoff" ]]; then notify "Screens off soon" "Off screens by 10:30 — asleep at 11:00."; fi
+}
+
+active_phase() {
+  local now current first id time
+  now=$(date +%H:%M)
+  first=$(config_json | jq -r '.phases | sort_by(.time) | .[0].id')
+  current=$(config_json | jq -r --arg now "$now" '.phases | sort_by(.time) | map(select(.time <= $now)) | last | .id // empty')
+  if [[ -n "$current" ]]; then printf '%s\n' "$current"; else
+    id=$(config_json | jq -r '.phases | sort_by(.time) | last | .id')
+    printf '%s\n' "$id"
+  fi
+}
+
+status_json() {
+  local phase paused lum warmth
+  phase=day
+  [[ -f "$STATE_DIR/phase" ]] && phase=$(<"$STATE_DIR/phase")
+  if is_paused; then paused=true; else paused=false; fi
+  lum=$(lum_get || phase_value "$phase" lum)
+  warmth=$(warmth_get || phase_value "$phase" warmth)
+  jq -nc --arg phase "$phase" --argjson paused "$paused" --argjson lum "${lum:-0}" --argjson warmth "${warmth:-0}" \
+    '{phase:$phase,paused:$paused,lum:$lum,warmth:$warmth}'
+}
+
+case "${1:-}" in
+  day|evening|winddown|cutoff) run_phase "$1" ;;
+  auto)
+    if is_paused; then exit 0; fi
+    [[ -f "$STATE_DIR/override" ]] && rm -f "$STATE_DIR/override"
+    run_phase "${2:-}"
+    ;;
+  sync) run_phase "$(active_phase)" ;;
+  lum) lum_set "${2:?brightness required}" ;;
+  temp) warmth_set "${2:?warmth required}" ;;
+  pause) date +%F > "$STATE_DIR/override"; notify "Night Vision paused" "Automation resumes tomorrow morning." ;;
+  resume) rm -f "$STATE_DIR/override"; run_phase "$(active_phase)" ;;
+  status)
+    json=$(status_json)
+    printf 'phase: %s\n' "$(jq -r .phase <<<"$json")"
+    printf 'override: %s\n' "$(jq -r 'if .paused then "yes" else "no" end' <<<"$json")"
+    printf 'enabled=%s strength=%s\n' "$(jq -r 'if .warmth > 0 then "yes" else "no" end' <<<"$json")" "$(jq -r .warmth <<<"$json")"
+    printf 'luminance: %s\n' "$(jq -r .lum <<<"$json")"
+    ;;
+  status-json) status_json ;;
+  *) printf 'Usage: %s {day|evening|winddown|cutoff|auto <phase>|sync|lum <0-100>|temp <0-100>|pause|resume|status|status-json}\n' "$0" >&2; exit 1 ;;
+esac
