@@ -11,7 +11,7 @@ ROOT="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 CONFIG="${NIGHT_VISION_CONFIG:-$HOME/.config/night-vision/config.json}"
 STATE_DIR="$HOME/.local/state/night-vision"
 NSHIFT="$ROOT/bin/nshift"
-DEFAULT_CONFIG='{"display":"ddc","phases":[{"id":"day","title":"Day","symbol":"sun.max.fill","time":"07:00","lum":41,"warmth":0},{"id":"evening","title":"Evening","symbol":"sun.horizon.fill","time":"20:00","lum":32,"warmth":60},{"id":"winddown","title":"Wind-down","symbol":"moon.fill","time":"21:30","lum":20,"warmth":85},{"id":"cutoff","title":"Cutoff","symbol":"moon.zzz.fill","time":"22:15","lum":8,"warmth":100}],"lights":[{"title":"Bedroom On","shortcut":"Bedroom on"},{"title":"Living Room Low","shortcut":"Living room low"},{"title":"Hallway Low","shortcut":"Hallway Low"},{"title":"Bathroom Low","shortcut":"Bathroom low"}]}'
+DEFAULT_CONFIG='{"display":"ddc","phases":[{"id":"day","title":"Day","symbol":"sun.max.fill","time":"07:00","lum":48,"warmth":0},{"id":"evening","title":"Evening","symbol":"sun.horizon.fill","time":"20:00","lum":32,"warmth":60},{"id":"winddown","title":"Wind-down","symbol":"moon.fill","time":"20:30","lum":18,"warmth":90},{"id":"cutoff","title":"Cutoff","symbol":"moon.zzz.fill","time":"22:15","lum":6,"warmth":100}],"lights":[{"title":"Bedroom On","shortcut":"Bedroom on"},{"title":"Living Room Low","shortcut":"Living room low"},{"title":"Hallway Low","shortcut":"Hallway Low"},{"title":"Bathroom Low","shortcut":"Bathroom low"}]}'
 mkdir -p "$STATE_DIR"
 
 config_json() {
@@ -26,12 +26,58 @@ config_value() { config_json | jq -r "$1"; }
 phase_value() { config_json | jq -r --arg id "$1" --arg field "$2" '.phases[] | select(.id == $id) | .[$field]'; }
 phase_exists() { config_json | jq -e --arg id "$1" '.phases[] | select(.id == $id)' >/dev/null; }
 
+appearance_for_phase() {
+  local id="$1" appearance
+  appearance=$(phase_value "$id" appearance)
+  if [[ "$appearance" == "null" || -z "$appearance" ]]; then
+    if [[ "$id" == "day" ]]; then appearance=light; else appearance=dark; fi
+  fi
+  case "$appearance" in
+    light|dark) printf '%s\n' "$appearance" ;;
+    *) printf 'Unsupported appearance for phase %s: %s\n' "$id" "$appearance" >&2; return 1 ;;
+  esac
+}
+
+appearance_set() {
+  local appearance="$1" dark actual attempt
+  case "$appearance" in
+    light) dark=false ;;
+    dark) dark=true ;;
+    *) printf 'Unsupported appearance: %s\n' "$appearance" >&2; return 1 ;;
+  esac
+
+  # Night Vision owns the appearance schedule; disable macOS's competing
+  # sunrise/sunset automation before applying the phase's explicit mode.
+  /usr/bin/defaults write -g AppleInterfaceStyleSwitchesAutomatically -bool false
+
+  for attempt in 1 2 3; do
+    if /usr/bin/osascript \
+      -e 'tell application "System Events"' \
+      -e 'launch' \
+      -e "tell appearance preferences to set dark mode to $dark" \
+      -e 'end tell' >/dev/null 2>&1; then
+      actual=$(/usr/bin/osascript -e 'tell application "System Events" to get dark mode of appearance preferences' 2>/dev/null || true)
+      [[ "$actual" == "$dark" ]] && return 0
+    fi
+    /usr/bin/killall 'System Events' >/dev/null 2>&1 || true
+    /bin/sleep 0.5
+  done
+  printf 'Failed to set macOS appearance to %s after %d attempts\n' "$appearance" "$attempt" >&2
+  return 1
+}
+
 lum_set() {
   local value="$1" backend
   backend=$(config_value '.display')
   case "$backend" in
     ddc) /opt/homebrew/bin/m1ddc set luminance "$value" >/dev/null ;;
-    internal) /opt/homebrew/bin/brightness "$(jq -n --argjson value "$value" '$value / 100')" >/dev/null ;;
+    internal)
+      if [[ -x "$ROOT/bin/nvbrightness" ]]; then
+        "$ROOT/bin/nvbrightness" set "$(jq -n --argjson value "$value" '$value / 100')" >/dev/null
+      else
+        /opt/homebrew/bin/brightness "$(jq -n --argjson value "$value" '$value / 100')" >/dev/null
+      fi
+      ;;
     *) printf 'Unsupported display backend: %s\n' "$backend" >&2; return 1 ;;
   esac
 }
@@ -45,9 +91,13 @@ lum_get() {
       grep -Eo '[0-9]+([.][0-9]+)?' <<<"$output" | tail -1
       ;;
     internal)
-      output=$(/opt/homebrew/bin/brightness -l)
       local fraction
-      fraction=$(grep -Eo 'brightness [0-9]+([.][0-9]+)?' <<<"$output" | tail -1 | cut -d' ' -f2)
+      if [[ -x "$ROOT/bin/nvbrightness" ]]; then
+        fraction=$("$ROOT/bin/nvbrightness" get)
+      else
+        output=$(/opt/homebrew/bin/brightness -l)
+        fraction=$(grep -Eo 'brightness [0-9]+([.][0-9]+)?' <<<"$output" | tail -1 | cut -d' ' -f2)
+      fi
       jq -nr --arg value "$fraction" '($value | tonumber) * 100 | round'
       ;;
     *) printf 'Unsupported display backend: %s\n' "$backend" >&2; return 1 ;;
@@ -68,21 +118,33 @@ warmth_get() {
   fi
 }
 
+AWAY="$STATE_DIR/away"
+is_away() { [[ -f "$AWAY" ]]; }
+
 is_paused() { [[ -f "$STATE_DIR/override" ]] && [[ "$(<"$STATE_DIR/override")" == "$(date +%F)" ]]; }
 notify() { /usr/bin/osascript -e "display notification \"$2\" with title \"$1\""; }
 
 run_phase() {
-  local id="$1" lum warmth title
+  local id="$1" lum warmth title appearance
   phase_exists "$id" || { printf 'Unknown phase: %s\n' "$id" >&2; return 1; }
   lum=$(phase_value "$id" lum)
   warmth=$(phase_value "$id" warmth)
   title=$(phase_value "$id" title)
+  appearance=$(appearance_for_phase "$id")
   warmth_set "$warmth"
-  lum_set "$lum"
+  # While away the screen stays dark; the phase's brightness is what "back" restores.
+  if is_away; then printf '%s\n' "$lum" > "$AWAY"; else lum_set "$lum"; fi
   printf '%s\n' "$id" > "$STATE_DIR/phase"
   [[ "$id" == "day" ]] && rm -f "$STATE_DIR/override"
-  if [[ "$id" == "winddown" ]]; then notify "$title" "90 min to lights-out. Start wrapping up heavy work."; fi
-  if [[ "$id" == "cutoff" ]]; then notify "Screens off soon" "Off screens by 10:30 — asleep at 11:00."; fi
+  # Appearance automation can fail independently (for example, System Events
+  # is unavailable). Keep the successfully applied display phase and report it.
+  if ! appearance_set "$appearance"; then
+    printf 'Display phase %s applied; macOS appearance did not change\n' "$id" >&2
+    return 1
+  fi
+  printf 'Applied phase %s at %s\n' "$id" "$(date '+%Y-%m-%d %H:%M:%S %Z')"
+  if [[ "$id" == "winddown" ]]; then notify "$title" "2 hours to lights-out. Start wrapping up heavy work."; fi
+  if [[ "$id" == "cutoff" ]]; then notify "Screens off soon" "Off screens by 10:15 — asleep at 10:30."; fi
 }
 
 active_phase() {
@@ -96,36 +158,121 @@ active_phase() {
   fi
 }
 
+schedule_sync() {
+  local agents="${NIGHT_VISION_AGENTS_DIR:-$HOME/Library/LaunchAgents}"
+  local launchctl="${NIGHT_VISION_LAUNCHCTL:-/bin/launchctl}"
+  local template="$ROOT/launchd/phase.plist.template"
+  local cli="${NIGHT_VISION_CLI:-$HOME/.local/bin/nightvision}"
+  local id time hour minute label target tmp
+  [[ -f "$CONFIG" && -f "$template" ]] || { printf 'Missing schedule config or template\n' >&2; return 1; }
+  if [[ -z "${NIGHT_VISION_CLI:-}" ]]; then
+    local resolved_cli
+    resolved_cli=$(realpath "$cli") || return 1
+    if [[ "$resolved_cli" == /Volumes/* ]]; then
+      printf 'Schedule CLI resolves to external volume: %s. Reinstall Night Vision.\n' "$resolved_cli" >&2
+      return 1
+    fi
+  fi
+  jq -e '.phases | (map(.id) | sort) == ["cutoff", "day", "evening", "winddown"] and all(.[]; (.time | test("^([01][0-9]|2[0-3]):[0-5][0-9]$"))) and ((map(.time) | unique | length) == 4)' "$CONFIG" >/dev/null || {
+    printf 'Invalid scheduled phase, time, or duplicate time\n' >&2; return 1;
+  }
+  mkdir -p "$agents" "$STATE_DIR"
+  while IFS=$'\t' read -r id time; do
+    case "$id" in day|evening|winddown|cutoff) ;; *) printf 'Unsupported phase id: %s\n' "$id" >&2; return 1 ;; esac
+    hour=$((10#${time%:*}))
+    minute=$((10#${time#*:}))
+    label="com.aneyman.nightvision.$id"
+    target="$agents/$label.plist"
+    tmp=$(mktemp "$target.XXXXXX")
+    sed -e "s|__PHASE__|$id|g" -e "s|__CLI__|$cli|g" -e "s|__HOUR__|$hour|g" \
+      -e "s|__MINUTE__|$minute|g" -e "s|__STATE__|$STATE_DIR|g" "$template" > "$tmp"
+    mv "$tmp" "$target"
+    "$launchctl" bootout "gui/$UID/$label" 2>/dev/null || true
+    if [[ "$(config_value 'if .scheduleEnabled == null then true else .scheduleEnabled end')" == true ]]; then
+      "$launchctl" bootstrap "gui/$UID" "$target"
+    fi
+  done < <(jq -r '.phases[] | [.id, .time] | @tsv' "$CONFIG")
+}
+
 status_json() {
-  local phase paused lum warmth
+  local phase paused away lum warmth brightness
   phase=day
   [[ -f "$STATE_DIR/phase" ]] && phase=$(<"$STATE_DIR/phase")
   if is_paused; then paused=true; else paused=false; fi
+  if is_away; then away=true; else away=false; fi
   lum=$(lum_get || phase_value "$phase" lum)
   warmth=$(warmth_get || phase_value "$phase" warmth)
-  jq -nc --arg phase "$phase" --argjson paused "$paused" --argjson lum "${lum:-0}" --argjson warmth "${warmth:-0}" \
-    '{phase:$phase,paused:$paused,lum:$lum,warmth:$warmth}'
+  if [[ -x "$ROOT/bin/nvbrightness" ]] && brightness=$("$ROOT/bin/nvbrightness" status 2>/dev/null); then
+    jq -nc --arg phase "$phase" --argjson paused "$paused" --argjson lum "${lum:-0}" \
+      --argjson warmth "${warmth:-0}" --argjson brightness "$brightness" --argjson away "$away" \
+      '{phase:$phase,paused:$paused,away:$away,lum:$lum,warmth:$warmth,brightness:$brightness}'
+  else
+    jq -nc --arg phase "$phase" --argjson paused "$paused" --argjson away "$away" --argjson lum "${lum:-0}" --argjson warmth "${warmth:-0}" \
+      '{phase:$phase,paused:$paused,away:$away,lum:$lum,warmth:$warmth}'
+  fi
 }
 
 case "${1:-}" in
-  day|evening|winddown|cutoff) run_phase "$1" ;;
+  day|evening|winddown|cutoff)
+    # Explicit phase pick puts the schedule back in charge after a manual hold.
+    rm -f "$STATE_DIR/override"
+    run_phase "$1"
+    ;;
   auto)
+    [[ "$(config_value 'if .scheduleEnabled == null then true else .scheduleEnabled end')" == true ]] || exit 0
+    # The morning transition ends a hold even if it was set after midnight.
+    [[ "${2:-}" == day ]] && rm -f "$STATE_DIR/override"
     if is_paused; then exit 0; fi
     [[ -f "$STATE_DIR/override" ]] && rm -f "$STATE_DIR/override"
     run_phase "${2:-}"
     ;;
   sync) run_phase "$(active_phase)" ;;
-  lum) lum_set "${2:?brightness required}" ;;
-  temp) warmth_set "${2:?warmth required}" ;;
+  schedule-sync) schedule_sync ;;
+  away)
+    # Keep the first saved level if away is pressed twice. The menu app passes
+    # the level from before the key press that started the chord.
+    if ! is_away; then
+      saved="${2:-}"
+      [[ -n "$saved" ]] || saved=$(lum_get 2>/dev/null || true)
+      printf '%s\n' "$saved" > "$AWAY"
+    fi
+    lum_set 0
+    ;;
+  back)
+    is_away || exit 0
+    saved=$(<"$AWAY")
+    # Drop the flag first: if the restore fails the screen stays dim but
+    # visible, and the brightness keys still work.
+    rm -f "$AWAY"
+    if ! [[ "$saved" =~ ^[0-9]+([.][0-9]+)?$ ]] || [[ "${saved%.*}" == 0 ]]; then
+      phase=day
+      [[ -f "$STATE_DIR/phase" ]] && phase=$(<"$STATE_DIR/phase")
+      saved=$(phase_value "$phase" lum)
+    fi
+    lum_set "$saved"
+    ;;
+  lum)
+    # A hand-set brightness ends away; the menu app drops its blackout.
+    rm -f "$AWAY"
+    lum_set "${2:?brightness required}"
+    # Manual adjustment holds the schedule until tomorrow's day phase, so
+    # launchd phase jobs stop clobbering a hand-set brightness.
+    date +%F > "$STATE_DIR/override"
+    ;;
+  temp)
+    warmth_set "${2:?warmth required}"
+    date +%F > "$STATE_DIR/override"
+    ;;
   pause) date +%F > "$STATE_DIR/override"; notify "Night Vision paused" "Automation resumes tomorrow morning." ;;
   resume) rm -f "$STATE_DIR/override"; run_phase "$(active_phase)" ;;
   status)
     json=$(status_json)
     printf 'phase: %s\n' "$(jq -r .phase <<<"$json")"
+    printf 'away: %s\n' "$(jq -r 'if .away then "yes" else "no" end' <<<"$json")"
     printf 'override: %s\n' "$(jq -r 'if .paused then "yes" else "no" end' <<<"$json")"
     printf 'enabled=%s strength=%s\n' "$(jq -r 'if .warmth > 0 then "yes" else "no" end' <<<"$json")" "$(jq -r .warmth <<<"$json")"
     printf 'luminance: %s\n' "$(jq -r .lum <<<"$json")"
     ;;
   status-json) status_json ;;
-  *) printf 'Usage: %s {day|evening|winddown|cutoff|auto <phase>|sync|lum <0-100>|temp <0-100>|pause|resume|status|status-json}\n' "$0" >&2; exit 1 ;;
+  *) printf 'Usage: %s {day|evening|winddown|cutoff|auto <phase>|sync|schedule-sync|lum <0-100>|temp <0-100>|away [level]|back|pause|resume|status|status-json}\n' "$0" >&2; exit 1 ;;
 esac

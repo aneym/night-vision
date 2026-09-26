@@ -2,7 +2,15 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>Label</key><string>com.aneyman.nightvision.menubar</string>
-<key>ProgramArguments</key><array><string>/usr/bin/open</string><string>-a</string><string>__APP__</string></array>
+<!-- At login, `open -a` can fire before LaunchServices is ready (-600/-609) or
+     before an external volume holding the app is mounted. Retry until the app
+     is running rather than failing once. The loop is inline because launchd
+     cannot exec scripts on external volumes. -->
+<key>ProgramArguments</key><array>
+<string>/bin/bash</string><string>-c</string>
+<string>APP="$1"; PAT="/${APP##*/}/Contents/MacOS/"; up() { pgrep -qf "$PAT" &amp;&amp; sleep 3 &amp;&amp; pgrep -qf "$PAT"; }; for i in $(seq 1 60); do up &amp;&amp; exit 0; [ -d "$APP" ] &amp;&amp; /usr/bin/open -a "$APP" &amp;&amp; sleep 3 &amp;&amp; continue; sleep 5; done; up</string>
+<string>--</string><string>__APP__</string>
+</array>
 <key>RunAtLoad</key><true/>
 <key>StandardOutPath</key><string>__STATE__/menubar.log</string>
 <key>StandardErrorPath</key><string>__STATE__/menubar.log</string>

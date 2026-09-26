@@ -1,11 +1,14 @@
 import SwiftUI
 import AppKit
+import CoreGraphics
 
 // MARK: - Paths & phase model
 
 enum NV {
     static let nightvision = NSString(string: "~/.local/bin/nightvision").expandingTildeInPath
     static let config = NSString(string: "~/.config/night-vision/config.json").expandingTildeInPath
+    /// Present while away; holds the brightness to restore. Written by the CLI.
+    static let awayFlag = NSString(string: "~/.local/state/night-vision/away").expandingTildeInPath
 }
 
 struct PhaseSpec: Codable {
@@ -22,26 +25,36 @@ struct LightSpec: Codable {
     let shortcut: String
 }
 
+/// Step sizes for the global F1/F2 display keys, tunable without a rebuild.
+struct KeyStepSpec: Codable {
+    let brightness: Int
+    let warmth: Int
+}
+
 struct NightVisionConfig: Codable {
     let display: String
     let phases: [PhaseSpec]
-    let lights: [LightSpec]
+    let lights: [LightSpec]?
+    let keySteps: KeyStepSpec?
+    let scheduleEnabled: Bool?
 }
 
 let FALLBACK_CONFIG = NightVisionConfig(
     display: "ddc",
     phases: [
-        .init(id: "day", title: "Day", symbol: "sun.max.fill", time: "07:00", lum: 41, warmth: 0),
+        .init(id: "day", title: "Day", symbol: "sun.max.fill", time: "07:00", lum: 48, warmth: 0),
         .init(id: "evening", title: "Evening", symbol: "sun.horizon.fill", time: "20:00", lum: 32, warmth: 60),
-        .init(id: "winddown", title: "Wind-down", symbol: "moon.fill", time: "21:30", lum: 20, warmth: 85),
-        .init(id: "cutoff", title: "Cutoff", symbol: "moon.zzz.fill", time: "22:15", lum: 8, warmth: 100),
+        .init(id: "winddown", title: "Wind-down", symbol: "moon.fill", time: "20:30", lum: 18, warmth: 90),
+        .init(id: "cutoff", title: "Cutoff", symbol: "moon.zzz.fill", time: "22:15", lum: 6, warmth: 100),
     ],
     lights: [
         .init(title: "Bedroom On", shortcut: "Bedroom on"),
         .init(title: "Living Room Low", shortcut: "Living room low"),
         .init(title: "Hallway Low", shortcut: "Hallway Low"),
         .init(title: "Bathroom Low", shortcut: "Bathroom low"),
-    ]
+    ],
+    keySteps: .init(brightness: 5, warmth: 20),
+    scheduleEnabled: true
 )
 
 func loadConfig() -> NightVisionConfig {
@@ -51,25 +64,57 @@ func loadConfig() -> NightVisionConfig {
     return config
 }
 
-let CONFIG = loadConfig()
-let PHASES = CONFIG.phases
-let SCENE_MAX = Double(PHASES.count - 1)
+enum ScheduleStore {
+    static func save(enabled: Bool? = nil, phase: PhaseSpec? = nil) throws {
+        let url = URL(fileURLWithPath: NV.config)
+        let source: Data
+        if FileManager.default.fileExists(atPath: url.path) {
+            source = try Data(contentsOf: url)
+        } else {
+            source = try JSONEncoder().encode(FALLBACK_CONFIG)
+        }
+        guard var root = try JSONSerialization.jsonObject(with: source) as? [String: Any],
+              var phases = root["phases"] as? [[String: Any]] else {
+            throw NSError(domain: "NightVision", code: 1, userInfo: [NSLocalizedDescriptionKey: "Invalid schedule configuration"])
+        }
+        if let enabled { root["scheduleEnabled"] = enabled }
+        if let phase {
+            guard let index = phases.firstIndex(where: { $0["id"] as? String == phase.id }) else {
+                throw NSError(domain: "NightVision", code: 2, userInfo: [NSLocalizedDescriptionKey: "Period no longer exists"])
+            }
+            guard !phases.enumerated().contains(where: { offset, item in
+                offset != index && item["time"] as? String == phase.time
+            }) else {
+                throw NSError(domain: "NightVision", code: 3, userInfo: [NSLocalizedDescriptionKey: "Another period already starts at this time"])
+            }
+            phases[index]["time"] = phase.time
+            phases[index]["lum"] = Int(phase.lum.rounded())
+            phases[index]["warmth"] = Int(phase.warmth.rounded())
+            root["phases"] = phases
+        }
+        let data = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try data.write(to: url, options: .atomic)
+    }
+}
 
-func curveValues(at t: Double) -> (lum: Double, warmth: Double) {
-    let clamped = min(max(t, 0), SCENE_MAX)
-    let i = min(Int(clamped), PHASES.count - 2)
+let CONFIG = loadConfig()
+
+func curveValues(at t: Double, phases: [PhaseSpec]) -> (lum: Double, warmth: Double) {
+    let clamped = min(max(t, 0), Double(phases.count - 1))
+    let i = min(Int(clamped), phases.count - 2)
     let f = clamped - Double(i)
-    let a = PHASES[i], b = PHASES[i + 1]
+    let a = phases[i], b = phases[i + 1]
     return (a.lum + (b.lum - a.lum) * f, a.warmth + (b.warmth - a.warmth) * f)
 }
 
 /// Project an arbitrary (lum, warmth) back onto the arc; residual > ~0.06 means "custom mix".
-func curvePosition(lum: Double, warmth: Double) -> (t: Double, residual: Double) {
+func curvePosition(lum: Double, warmth: Double, phases: [PhaseSpec]) -> (t: Double, residual: Double) {
     var best = (t: 0.0, d: Double.greatestFiniteMagnitude)
     let px = lum / 100.0, py = warmth / 100.0
-    for i in 0..<(PHASES.count - 1) {
-        let ax = PHASES[i].lum / 100, ay = PHASES[i].warmth / 100
-        let bx = PHASES[i + 1].lum / 100, by = PHASES[i + 1].warmth / 100
+    for i in 0..<(phases.count - 1) {
+        let ax = phases[i].lum / 100, ay = phases[i].warmth / 100
+        let bx = phases[i + 1].lum / 100, by = phases[i + 1].warmth / 100
         let abx = bx - ax, aby = by - ay
         let len2 = abx * abx + aby * aby
         var f = len2 > 0 ? ((px - ax) * abx + (py - ay) * aby) / len2 : 0
@@ -153,8 +198,72 @@ final class DeviceIO {
         queue.async { self.run("/usr/bin/shortcuts", ["run", name]) }
     }
 
-    func runCLI(_ args: [String]) {
-        queue.async { self.run(NV.nightvision, args) }
+    func runCLI(_ args: [String], then completion: (() -> Void)? = nil) {
+        queue.async {
+            self.run(NV.nightvision, args)
+            if let completion { DispatchQueue.main.async(execute: completion) }
+        }
+    }
+
+    func refreshSchedule(completion: @escaping (String?) -> Void) {
+        queue.async {
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: NV.nightvision)
+            proc.arguments = ["schedule-sync"]
+            let pipe = Pipe()
+            proc.standardError = pipe
+            proc.standardOutput = Pipe()
+            do { try proc.run() } catch {
+                DispatchQueue.main.async { completion(error.localizedDescription) }
+                return
+            }
+            let error = pipe.fileHandleForReading.readDataToEndOfFile()
+            proc.waitUntilExit()
+            let message = proc.terminationStatus == 0 ? nil : (String(data: error, encoding: .utf8) ?? "Could not refresh schedule")
+            DispatchQueue.main.async { completion(message) }
+        }
+    }
+
+    func reapplyExpandedBrightness() {
+        queue.async {
+            let helper = NSString(string: "~/.local/share/night-vision/bin/nvbrightness").expandingTildeInPath
+            _ = self.run(helper, ["reapply"])
+        }
+    }
+}
+
+// MARK: - Away blackout
+
+/// Holds every online display's gamma at black while away. macOS drops a
+/// process's gamma table when it exits, so only this long-running app can hold
+/// it; the CLI owns the hardware half (brightness 0, then restore).
+enum Blackout {
+    private static let black: [CGGammaValue] = [0, 0]
+
+    private static func displays() -> [CGDirectDisplayID] {
+        var count: UInt32 = 0
+        guard CGGetOnlineDisplayList(0, nil, &count) == .success, count > 0 else { return [] }
+        var ids = [CGDirectDisplayID](repeating: 0, count: Int(count))
+        guard CGGetOnlineDisplayList(count, &ids, &count) == .success else { return [] }
+        return Array(ids.prefix(Int(count)))
+    }
+
+    /// True when every online display's transfer table peaks at zero.
+    static var isHeld: Bool {
+        displays().allSatisfy { id in
+            var r = [CGGammaValue](repeating: 0, count: 256), g = r, b = r
+            var n: UInt32 = 0
+            guard CGGetDisplayTransferByTable(id, 256, &r, &g, &b, &n) == .success, n > 0 else { return false }
+            return max(r[Int(n) - 1], g[Int(n) - 1], b[Int(n) - 1]) == 0
+        }
+    }
+
+    static func engage() {
+        for id in displays() { CGSetDisplayTransferByTable(id, 2, black, black, black) }
+    }
+
+    static func release() {
+        CGDisplayRestoreColorSyncSettings()
     }
 }
 
@@ -162,36 +271,52 @@ final class DeviceIO {
 
 @MainActor
 final class Model: ObservableObject {
+    @Published var phases = CONFIG.phases
+    @Published var scheduleEnabled = CONFIG.scheduleEnabled ?? true
+    @Published var scheduleError: String?
     @Published var lum: Double = 41
     @Published var warmth: Double = 0
     @Published var scenePos: Double = 0
     @Published var isCustom = false
     @Published var paused = false
+    @Published var away = false
     var isInteracting = false
+    /// Set while an away/back CLI call is in flight, so the flag watcher does
+    /// not undo a transition the app itself started.
+    private var awayTransition = false
 
     init() {
         refresh()
+        // The flag file is the source of truth, so `nightvision away|back` run
+        // from anywhere (ssh, a phone) takes effect here within two seconds.
+        Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            DispatchQueue.main.async { self?.syncAway() }
+        }
+        DispatchQueue.main.async { self.syncAway() }
         Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             DispatchQueue.main.async { self?.refresh() }
         }
     }
 
-    var nearestIndex: Int { min(max(Int(scenePos.rounded()), 0), PHASES.count - 1) }
+    var sceneMax: Double { Double(phases.count - 1) }
+    var nearestIndex: Int { min(max(Int(scenePos.rounded()), 0), phases.count - 1) }
 
     var menuSymbol: String {
-        paused ? "pause.circle" : PHASES[nearestIndex].symbol
+        if away { return "eye.slash" }
+        return paused ? "pause.circle" : phases[nearestIndex].symbol
     }
 
     var phaseName: String {
         if isCustom { return "Custom mix" }
-        let i = min(Int(scenePos), PHASES.count - 2)
+        let i = min(Int(scenePos), phases.count - 2)
         let f = scenePos - Double(i)
-        if f < 0.15 { return PHASES[i].title }
-        if f > 0.85 { return PHASES[i + 1].title }
-        return "\(PHASES[i].title) → \(PHASES[i + 1].title)"
+        if f < 0.15 { return phases[i].title }
+        if f > 0.85 { return phases[i + 1].title }
+        return "\(phases[i].title) → \(phases[i + 1].title)"
     }
 
     var statusLine: String {
+        if away { return "Away · press a brightness key to return" }
         if paused { return "Paused · schedule resumes tomorrow" }
         let w = warmth <= 0 ? "no warmth" : "\(Int(warmth))% warm"
         return "\(phaseName) · \(Int(lum))% bright · \(w)"
@@ -214,7 +339,7 @@ final class Model: ObservableObject {
     }
 
     private func recomputeScene() {
-        let (t, r) = curvePosition(lum: lum, warmth: warmth)
+        let (t, r) = curvePosition(lum: lum, warmth: warmth, phases: phases)
         scenePos = t
         isCustom = r > 0.06
     }
@@ -222,8 +347,8 @@ final class Model: ObservableObject {
     // Scene slider: interpolate along the arc, push both channels.
     func dragScene(_ t: Double) {
         isInteracting = true
-        let v = curveValues(at: t)
-        scenePos = min(max(t, 0), SCENE_MAX)
+        let v = curveValues(at: t, phases: phases)
+        scenePos = min(max(t, 0), sceneMax)
         lum = v.lum
         warmth = v.warmth
         isCustom = false
@@ -232,7 +357,7 @@ final class Model: ObservableObject {
 
     func commitScene(_ t: Double) {
         let snapped = t.rounded()
-        if abs(t - snapped) < 0.1 && (0...SCENE_MAX).contains(snapped) {
+        if abs(t - snapped) < 0.1 && (0...sceneMax).contains(snapped) {
             applyPhase(Int(snapped))
         } else {
             dragScene(t)
@@ -241,7 +366,7 @@ final class Model: ObservableObject {
     }
 
     func applyPhase(_ index: Int) {
-        let p = PHASES[index]
+        let p = phases[index]
         scenePos = Double(index)
         lum = p.lum
         warmth = p.warmth
@@ -250,15 +375,66 @@ final class Model: ObservableObject {
     }
 
     func setLum(_ v: Double) {
-        lum = v
-        DeviceIO.shared.send(lum: Int(v.rounded()))
+        lum = min(max(v, 0), 100)
+        DeviceIO.shared.send(lum: Int(lum.rounded()))
         recomputeScene()
     }
 
+    func stepLum(_ delta: Int) {
+        setLum(lum + Double(delta))
+    }
+
     func setWarmth(_ v: Double) {
-        warmth = v
-        DeviceIO.shared.send(warmth: Int(v.rounded()))
+        warmth = min(max(v, 0), 100)
+        DeviceIO.shared.send(warmth: Int(warmth.rounded()))
         recomputeScene()
+    }
+
+    func stepWarmth(_ delta: Int) {
+        setWarmth(warmth + Double(delta))
+    }
+
+    // MARK: Away
+
+    /// Hardware to 0 and gamma to black, without sleeping anything. Gamma is
+    /// only blacked out while the key tap is live, because the brightness keys
+    /// are the way back.
+    /// `restoreTo` is the brightness to come back to when the caller already
+    /// changed it on the way in (the first key of a two-key chord steps once).
+    func goAway(restoreTo: Double? = nil) {
+        guard !away else { return }
+        away = true
+        awayTransition = true
+        if DisplayKeyMonitor.isLive { Blackout.engage() }
+        DisplayKeyMonitor.log("away")
+        let args = ["away"] + (restoreTo.map { [String(Int($0.rounded()))] } ?? [])
+        DeviceIO.shared.runCLI(args) { self.awayTransition = false }
+    }
+
+    func comeBack() {
+        guard away else { return }
+        away = false
+        awayTransition = true
+        Blackout.release()
+        DisplayKeyMonitor.log("back")
+        DeviceIO.shared.runCLI(["back"]) {
+            self.awayTransition = false
+            self.refresh()
+        }
+    }
+
+    private func syncAway() {
+        guard !awayTransition else { return }
+        let flagged = FileManager.default.fileExists(atPath: NV.awayFlag)
+        if flagged {
+            away = true
+            // Display reconfiguration and color-profile changes reset gamma.
+            if DisplayKeyMonitor.isLive && !Blackout.isHeld { Blackout.engage() }
+        } else if away {
+            away = false
+            Blackout.release()
+            refresh()
+        }
     }
 
     func setPaused(_ on: Bool) {
@@ -267,11 +443,30 @@ final class Model: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self.refresh() }
     }
 
+    func saveSchedule(enabled: Bool? = nil, phase: PhaseSpec? = nil) -> Bool {
+        do {
+            try ScheduleStore.save(enabled: enabled, phase: phase)
+            let refreshed = loadConfig()
+            phases = refreshed.phases
+            scheduleEnabled = refreshed.scheduleEnabled ?? true
+            recomputeScene()
+            scheduleError = nil
+            DeviceIO.shared.refreshSchedule { error in
+                if let error { self.scheduleError = error }
+            }
+            return true
+        } catch {
+            scheduleError = error.localizedDescription
+            return false
+        }
+    }
+
     var nextTransition: String {
         let cal = Calendar.current
         let now = Date()
         var best: (Date, String)?
-        for phase in PHASES {
+        guard scheduleEnabled else { return "Schedule off" }
+        for phase in phases {
             let parts = phase.time.split(separator: ":").compactMap { Int($0) }
             guard parts.count == 2,
                   let d = cal.nextDate(after: now,
@@ -307,18 +502,18 @@ struct SceneSlider: View {
     var body: some View {
         GeometryReader { geo in
             let usable = geo.size.width - pad * 2
-            let cx = pad + usable * CGFloat(model.scenePos / SCENE_MAX)
+            let cx = pad + usable * CGFloat(model.scenePos / model.sceneMax)
             let cy = geo.size.height / 2
             ZStack {
                 Capsule()
                     .fill(trackGradient)
                     .frame(height: 10)
                     .overlay(Capsule().strokeBorder(Color.primary.opacity(0.08)))
-                ForEach(0..<PHASES.count, id: \.self) { i in
+                ForEach(0..<model.phases.count, id: \.self) { i in
                     Circle()
                         .fill(Color.white.opacity(0.75))
                         .frame(width: 3.5, height: 3.5)
-                        .position(x: pad + usable * CGFloat(i) / CGFloat(SCENE_MAX), y: cy)
+                        .position(x: pad + usable * CGFloat(i) / CGFloat(model.sceneMax), y: cy)
                 }
                 Circle()
                     .fill(.white)
@@ -355,7 +550,7 @@ struct SceneSlider: View {
 
     private func t(for x: CGFloat, usable: CGFloat) -> Double {
         guard usable > 0 else { return 0 }
-        return Double((x - pad) / usable) * SCENE_MAX
+        return Double((x - pad) / usable) * model.sceneMax
     }
 }
 
@@ -377,11 +572,12 @@ struct ContentView: View {
             channelSliders
             Divider()
             pauseRow
+            scheduleSection
             lights
             footer
         }
         .padding(14)
-        .frame(width: 300)
+        .frame(width: 340)
         .onAppear { model.refresh() }
     }
 
@@ -401,6 +597,7 @@ struct ContentView: View {
             }
             Spacer()
             Menu {
+                Button("Away: screen off (both brightness keys)") { model.goAway() }
                 Button("Refresh") { model.refresh() }
                 Divider()
                 Button("Quit Night Vision") { NSApplication.shared.terminate(nil) }
@@ -419,8 +616,8 @@ struct ContentView: View {
 
     private var phaseRow: some View {
         HStack(spacing: 6) {
-            ForEach(0..<PHASES.count, id: \.self) { i in
-                let p = PHASES[i]
+            ForEach(0..<model.phases.count, id: \.self) { i in
+                let p = model.phases[i]
                 let active = !model.isCustom && model.nearestIndex == i
                 Button {
                     if reduceMotion {
@@ -501,13 +698,17 @@ struct ContentView: View {
         .tint(NV_ACCENT)
     }
 
+    private var scheduleSection: some View {
+        ScheduleEditor(model: model)
+    }
+
     private var lights: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("Lights")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 6) {
-                ForEach(CONFIG.lights, id: \.shortcut) { light in
+                ForEach(CONFIG.lights ?? [], id: \.shortcut) { light in
                     lightButton(light.title, shortcut: light.shortcut)
                 }
             }
@@ -528,12 +729,12 @@ struct ContentView: View {
 
     private var footer: some View {
         HStack {
-            ForEach(0..<PHASES.count, id: \.self) { i in
-                let p = PHASES[i]
+            ForEach(0..<model.phases.count, id: \.self) { i in
+                let p = model.phases[i]
                 Label(p.time, systemImage: p.symbol)
                     .font(.caption2)
                     .foregroundStyle(!model.isCustom && model.nearestIndex == i ? Color.primary : Color.secondary)
-                if i < PHASES.count - 1 { Spacer() }
+                if i < model.phases.count - 1 { Spacer() }
             }
         }
         .overlay(alignment: .bottomLeading) {
@@ -541,6 +742,346 @@ struct ContentView: View {
         }
         .padding(.top, 2)
         .help(model.nextTransition)
+    }
+}
+
+struct ScheduleEditor: View {
+    @ObservedObject var model: Model
+    @State private var expanded = false
+    @State private var selectedID = "day"
+    @State private var hour = 7
+    @State private var minute = 0
+    @State private var brightness = 48.0
+    @State private var warmth = 0.0
+
+    private var selected: PhaseSpec? {
+        model.phases.first(where: { $0.id == selectedID })
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Toggle("Schedule", isOn: Binding(
+                    get: { model.scheduleEnabled },
+                    set: { _ = model.saveSchedule(enabled: $0) }
+                ))
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .tint(NV_ACCENT)
+                Spacer()
+                Button(expanded ? "Done" : "Edit periods") { expanded.toggle() }
+                    .font(.caption)
+                    .buttonStyle(.plain)
+                    .foregroundStyle(NV_ACCENT)
+            }
+            if expanded, let phase = selected {
+                Divider()
+                Picker("Period", selection: $selectedID) {
+                    ForEach(model.phases, id: \.id) { p in
+                        Label(p.title, systemImage: p.symbol).tag(p.id)
+                    }
+                }
+                .onChange(of: selectedID) { _, _ in loadSelected() }
+                HStack {
+                    Text("Starts at").font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    Picker("Hour", selection: $hour) {
+                        ForEach(0..<24, id: \.self) { Text(String(format: "%02d", $0)).tag($0) }
+                    }.labelsHidden().frame(width: 64)
+                    Text(":").foregroundStyle(.secondary)
+                    Picker("Minute", selection: $minute) {
+                        ForEach(0..<60, id: \.self) { Text(String(format: "%02d", $0)).tag($0) }
+                    }.labelsHidden().frame(width: 64)
+                }
+                settingRow("Brightness", value: $brightness)
+                settingRow("Warmth", value: $warmth)
+                HStack {
+                    Button("Use current settings") {
+                        brightness = model.lum.rounded()
+                        warmth = model.warmth.rounded()
+                    }
+                    .font(.caption)
+                    Spacer()
+                    Button("Save \(phase.title)") {
+                        let updated = PhaseSpec(
+                            id: phase.id, title: phase.title, symbol: phase.symbol,
+                            time: String(format: "%02d:%02d", hour, minute),
+                            lum: brightness.rounded(), warmth: warmth.rounded())
+                        _ = model.saveSchedule(phase: updated)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(NV_ACCENT)
+                    .controlSize(.small)
+                }
+                Text("Saving a period does not change your display now.")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+            if let error = model.scheduleError {
+                Text(error).font(.caption2).foregroundStyle(.red)
+            }
+        }
+        .onAppear {
+            if !model.phases.contains(where: { $0.id == selectedID }) {
+                selectedID = model.phases[0].id
+            }
+            loadSelected()
+        }
+    }
+
+    private func settingRow(_ title: String, value: Binding<Double>) -> some View {
+        VStack(spacing: 2) {
+            HStack {
+                Text(title)
+                Spacer()
+                Text("\(Int(value.wrappedValue.rounded()))%")
+                    .monospacedDigit()
+            }
+            .font(.caption)
+            Slider(value: value, in: 0...100, step: 1)
+                .controlSize(.small)
+                .tint(NV_ACCENT)
+                .accessibilityLabel("Scheduled \(title)")
+        }
+    }
+
+    private func loadSelected() {
+        guard let phase = selected else { return }
+        let parts = phase.time.split(separator: ":").compactMap { Int($0) }
+        if parts.count == 2 { hour = parts[0]; minute = parts[1] }
+        brightness = phase.lum
+        warmth = phase.warmth
+    }
+}
+
+// MARK: - Global display key handling
+
+final class DisplayKeyMonitor {
+    // Brightness is instant, so small steps feel precise. Night Shift ramps its
+    // color change over about a second, so warmth needs coarser steps to feel
+    // responsive. Both are overridable via "keySteps" in config.json.
+    private let brightnessStep = max(1, CONFIG.keySteps?.brightness ?? 5)
+    private let warmthStep = max(1, CONFIG.keySteps?.warmth ?? 20)
+    private let model: Model
+
+    /// macOS virtual key codes for the top-row keys we own.
+    private static let vkF1: Int64 = 122
+    private static let vkF2: Int64 = 120
+    /// NX_KEYTYPE codes carried in an NSSystemDefined aux-button event.
+    private static let auxBrightnessUp: Int64 = 2
+    private static let auxBrightnessDown: Int64 = 3
+    private static let auxSubtype: Int64 = 8
+    /// NX_SYSDEFINED — not exposed as a CGEventType case.
+    private static let systemDefined = CGEventType(rawValue: 14)!
+
+    private static let logPath = NSString(string: "~/.local/state/night-vision/keys.log").expandingTildeInPath
+    private static let debugFlag = NSString(string: "~/.local/state/night-vision/keydebug").expandingTildeInPath
+
+    /// True once the event tap is installed, i.e. the brightness keys can end away.
+    static var isLive = false
+
+    /// Two-key chord state, keyed by direction (true = brightness up).
+    private var held: [Bool: Date] = [:]
+    private var lastDown: [Bool: Date] = [:]
+    private var levelBeforePress: Double?
+    /// Presses right after going away or coming back belong to that gesture.
+    private var quietUntil = Date.distantPast
+    /// Both keys count as pressed together when the second lands this soon.
+    private static let chordWindow: TimeInterval = 0.15
+    /// A key still counts as held this long after its last down or repeat, so
+    /// a lost key-up cannot leave a stale hold that turns a later press into a chord.
+    private static let holdLimit: TimeInterval = 2.5
+
+    private var eventTap: CFMachPort?
+    private var runLoopSource: CFRunLoopSource?
+    private var retryTimer: Timer?
+
+    init(model: Model) {
+        self.model = model
+        install()
+    }
+
+    deinit {
+        retryTimer?.invalidate()
+        if let eventTap { CGEvent.tapEnable(tap: eventTap, enable: false) }
+        if let runLoopSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), runLoopSource, .commonModes) }
+    }
+
+    // MARK: Logging
+
+    /// Appends a line to the key log. Only ever called for the function-row and
+    /// display-control events this class owns, so it is not a keystroke record.
+    static func log(_ message: String) {
+        guard FileManager.default.fileExists(atPath: debugFlag) else { return }
+        let fmt = ISO8601DateFormatter()
+        fmt.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let stamped = "\(fmt.string(from: Date())) \(message)\n"
+        guard let data = stamped.data(using: .utf8) else { return }
+        let url = URL(fileURLWithPath: logPath)
+        if let handle = try? FileHandle(forWritingTo: url) {
+            defer { try? handle.close() }
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: data)
+        } else {
+            try? FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? data.write(to: url)
+        }
+    }
+
+    // MARK: Install
+
+    private func install() {
+        // Third-party keyboards send a plain F1/F2 keyDown; Apple keyboards send
+        // an NSSystemDefined brightness event. Tap both so either hardware works.
+        let mask = (CGEventMask(1) << CGEventType.keyDown.rawValue)
+            | (CGEventMask(1) << CGEventType.keyUp.rawValue)
+            | (CGEventMask(1) << Self.systemDefined.rawValue)
+        let context = Unmanaged.passUnretained(self).toOpaque()
+
+        eventTap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .defaultTap,
+            eventsOfInterest: mask,
+            callback: { proxy, type, event, context in
+                guard let context else { return Unmanaged.passUnretained(event) }
+                let monitor = Unmanaged<DisplayKeyMonitor>.fromOpaque(context).takeUnretainedValue()
+                return monitor.dispatch(proxy: proxy, type: type, event: event)
+            },
+            userInfo: context
+        )
+
+        guard let eventTap else {
+            Self.log("tapCreate failed — Accessibility not granted for this build; retrying")
+            scheduleRetry()
+            return
+        }
+
+        retryTimer?.invalidate()
+        retryTimer = nil
+        runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, eventTap, 0)
+        if let runLoopSource { CFRunLoopAddSource(CFRunLoopGetMain(), runLoopSource, .commonModes) }
+        CGEvent.tapEnable(tap: eventTap, enable: true)
+        Self.isLive = true
+        Self.log("event tap installed")
+    }
+
+    /// Accessibility can be granted after launch; keep trying so the user does
+    /// not have to know the app must be restarted.
+    private func scheduleRetry() {
+        guard retryTimer == nil else { return }
+        retryTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
+            guard let self, self.eventTap == nil else { return }
+            guard AXIsProcessTrusted() else { return }
+            self.install()
+        }
+    }
+
+    // MARK: Dispatch
+
+    private func dispatch(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
+        // The system disables a tap that stalls or that the user interrupts.
+        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            if let eventTap { CGEvent.tapEnable(tap: eventTap, enable: true) }
+            Self.log("tap re-enabled after \(type == .tapDisabledByTimeout ? "timeout" : "user input")")
+            return Unmanaged.passUnretained(event)
+        }
+        return handle(type: type, event: event) ? nil : Unmanaged.passUnretained(event)
+    }
+
+    /// Returns true when the event was consumed as a display control.
+    private func handle(type: CGEventType, event: CGEvent) -> Bool {
+        switch type {
+        case .keyDown: return handleFunctionKey(event)
+        case .keyUp:
+            // Observe only, to track holds for the two-key chord.
+            let code = event.getIntegerValueField(.keyboardEventKeycode)
+            if code == Self.vkF1 || code == Self.vkF2 { held[code == Self.vkF2] = nil }
+            return false
+        case Self.systemDefined: return handleAuxKey(event)
+        default: return false
+        }
+    }
+
+    private func handleFunctionKey(_ event: CGEvent) -> Bool {
+        let code = event.getIntegerValueField(.keyboardEventKeycode)
+        guard code == Self.vkF1 || code == Self.vkF2 else { return false }
+
+        // Leave Cmd/Ctrl chords to apps; bare, Shift and Option belong to us.
+        // Fn is not a discriminator here: with "use F1/F2 as function keys" off,
+        // macOS stamps maskSecondaryFn on every top-row press, chord or not.
+        let flags = event.flags
+        Self.log("keyDown code=\(code) flags=\(String(flags.rawValue, radix: 16))")
+        let others: CGEventFlags = [.maskCommand, .maskControl]
+        guard flags.intersection(others).isEmpty else { return false }
+
+        let up = code == Self.vkF2
+        let isRepeat = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
+        press(up: up, isRepeat: isRepeat, shift: flags.contains(.maskShift), option: flags.contains(.maskAlternate))
+        return true
+    }
+
+    private func handleAuxKey(_ event: CGEvent) -> Bool {
+        guard let nsEvent = NSEvent(cgEvent: event) else { return false }
+        let data = Int64(nsEvent.data1)
+        guard Int64(nsEvent.subtype.rawValue) == Self.auxSubtype else { return false }
+
+        let keyCode = (data >> 16) & 0xffff
+        Self.log("aux code=\(keyCode) flags=\(String(event.flags.rawValue, radix: 16))")
+        guard keyCode == Self.auxBrightnessUp || keyCode == Self.auxBrightnessDown else { return false }
+
+        // Swallow the key-up half too, so macOS never sees a half-press.
+        let isKeyDown = ((data >> 8) & 0xff) == 0x0a
+        let shift = event.flags.contains(.maskShift)
+        let up = keyCode == Self.auxBrightnessUp
+        Self.log("aux \(up ? "up" : "down") \(isKeyDown ? "keyDown" : "keyUp") shift=\(shift) flags=\(String(event.flags.rawValue, radix: 16))")
+        guard isKeyDown else {
+            held[up] = nil
+            return true
+        }
+        let isRepeat = (data & 0x1) != 0
+        press(up: up, isRepeat: isRepeat, shift: shift, option: event.flags.contains(.maskAlternate))
+        return true
+    }
+
+    /// Both brightness keys together (or Option with brightness down) go away.
+    /// While away, any brightness key only brings the screen back.
+    /// The tap runs on the main run loop, so the model is safe to touch here.
+    private func press(up: Bool, isRepeat: Bool, shift: Bool, option: Bool) {
+        MainActor.assumeIsolated {
+            let now = Date()
+            let other = !up
+            let otherHeld = held[other].map { now.timeIntervalSince($0) < Self.holdLimit } ?? false
+            let otherJustPressed = lastDown[other].map { now.timeIntervalSince($0) < Self.chordWindow } ?? false
+            held[up] = now
+            if !isRepeat { lastDown[up] = now }
+
+            guard now >= quietUntil else { return }
+            if model.away {
+                guard !isRepeat else { return }
+                model.comeBack()
+                quietUntil = now.addingTimeInterval(0.6)
+                return
+            }
+            if !isRepeat && (otherHeld || otherJustPressed) {
+                Self.log("chord: away")
+                model.goAway(restoreTo: levelBeforePress)
+                quietUntil = now.addingTimeInterval(0.6)
+                return
+            }
+            if option && !up {
+                model.goAway()
+                quietUntil = now.addingTimeInterval(0.6)
+                return
+            }
+            let sign = up ? 1 : -1
+            if shift {
+                model.stepWarmth(sign * warmthStep)
+            } else {
+                levelBeforePress = model.lum
+                model.stepLum(sign * brightnessStep)
+            }
+        }
     }
 }
 
@@ -555,7 +1096,14 @@ struct MenuBarLabel: View {
 
 @main
 struct NightVisionApp: App {
-    @StateObject private var model = Model()
+    @StateObject private var model: Model
+    private let keyMonitor: DisplayKeyMonitor
+
+    init() {
+        let model = Model()
+        _model = StateObject(wrappedValue: model)
+        keyMonitor = DisplayKeyMonitor(model: model)
+    }
 
     var body: some Scene {
         MenuBarExtra {
