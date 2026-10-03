@@ -37,6 +37,8 @@ struct NightVisionConfig: Codable {
     let lights: [LightSpec]?
     let keySteps: KeyStepSpec?
     let scheduleEnabled: Bool?
+    /// Day the schedule was switched off; it switches back on the next day.
+    let scheduleOffOn: String?
 }
 
 let FALLBACK_CONFIG = NightVisionConfig(
@@ -54,7 +56,8 @@ let FALLBACK_CONFIG = NightVisionConfig(
         .init(title: "Bathroom Low", shortcut: "Bathroom low"),
     ],
     keySteps: .init(brightness: 5, warmth: 20),
-    scheduleEnabled: true
+    scheduleEnabled: true,
+    scheduleOffOn: nil
 )
 
 func loadConfig() -> NightVisionConfig {
@@ -77,7 +80,10 @@ enum ScheduleStore {
               var phases = root["phases"] as? [[String: Any]] else {
             throw NSError(domain: "NightVision", code: 1, userInfo: [NSLocalizedDescriptionKey: "Invalid schedule configuration"])
         }
-        if let enabled { root["scheduleEnabled"] = enabled }
+        if let enabled {
+            root["scheduleEnabled"] = enabled
+            if enabled { root.removeValue(forKey: "scheduleOffOn") } else { root["scheduleOffOn"] = todayStamp() }
+        }
         if let phase {
             guard let index = phases.firstIndex(where: { $0["id"] as? String == phase.id }) else {
                 throw NSError(domain: "NightVision", code: 2, userInfo: [NSLocalizedDescriptionKey: "Period no longer exists"])
@@ -99,6 +105,13 @@ enum ScheduleStore {
 }
 
 let CONFIG = loadConfig()
+
+func todayStamp() -> String {
+    let f = DateFormatter()
+    f.locale = Locale(identifier: "en_US_POSIX")
+    f.dateFormat = "yyyy-MM-dd"
+    return f.string(from: Date())
+}
 
 func curveValues(at t: Double, phases: [PhaseSpec]) -> (lum: Double, warmth: Double) {
     let clamped = min(max(t, 0), Double(phases.count - 1))
@@ -324,6 +337,10 @@ final class Model: ObservableObject {
 
     func refresh() {
         if isInteracting { return }
+        // An "off" schedule only lasts the day it was switched off.
+        if !scheduleEnabled, loadConfig().scheduleOffOn != todayStamp() {
+            _ = saveSchedule(enabled: true)
+        }
         DispatchQueue.global(qos: .utility).async {
             let s = DeviceIO.shared.readDevice()
             DispatchQueue.main.async { self.apply(s) }
@@ -866,6 +883,12 @@ final class DisplayKeyMonitor {
     /// macOS virtual key codes for the top-row keys we own.
     private static let vkF1: Int64 = 122
     private static let vkF2: Int64 = 120
+    /// F14/F15: what keyboards like the NuPhy Gem80 send for brightness
+    /// down/up without Fn (HID Scroll Lock/Pause).
+    private static let vkF14: Int64 = 107
+    private static let vkF15: Int64 = 113
+    private static let downKeys: Set<Int64> = [vkF1, vkF14]
+    private static let upKeys: Set<Int64> = [vkF2, vkF15]
     /// NX_KEYTYPE codes carried in an NSSystemDefined aux-button event.
     private static let auxBrightnessUp: Int64 = 2
     private static let auxBrightnessDown: Int64 = 3
@@ -996,7 +1019,7 @@ final class DisplayKeyMonitor {
         case .keyUp:
             // Observe only, to track holds for the two-key chord.
             let code = event.getIntegerValueField(.keyboardEventKeycode)
-            if code == Self.vkF1 || code == Self.vkF2 { held[code == Self.vkF2] = nil }
+            if Self.downKeys.contains(code) || Self.upKeys.contains(code) { held[Self.upKeys.contains(code)] = nil }
             return false
         case Self.systemDefined: return handleAuxKey(event)
         default: return false
@@ -1005,7 +1028,7 @@ final class DisplayKeyMonitor {
 
     private func handleFunctionKey(_ event: CGEvent) -> Bool {
         let code = event.getIntegerValueField(.keyboardEventKeycode)
-        guard code == Self.vkF1 || code == Self.vkF2 else { return false }
+        guard Self.downKeys.contains(code) || Self.upKeys.contains(code) else { return false }
 
         // Leave Cmd/Ctrl chords to apps; bare, Shift and Option belong to us.
         // Fn is not a discriminator here: with "use F1/F2 as function keys" off,
@@ -1015,7 +1038,7 @@ final class DisplayKeyMonitor {
         let others: CGEventFlags = [.maskCommand, .maskControl]
         guard flags.intersection(others).isEmpty else { return false }
 
-        let up = code == Self.vkF2
+        let up = Self.upKeys.contains(code)
         let isRepeat = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
         press(up: up, isRepeat: isRepeat, shift: flags.contains(.maskShift), option: flags.contains(.maskAlternate))
         return true

@@ -158,6 +158,18 @@ active_phase() {
   fi
 }
 
+schedule_enabled() { [[ "$(config_value 'if .scheduleEnabled == null then true else .scheduleEnabled end')" == true ]]; }
+
+# Turning the schedule off lasts one day: from the next day on it is back on.
+schedule_reenable_if_stale() {
+  schedule_enabled && return 1
+  [[ "$(config_value '.scheduleOffOn // ""')" == "$(date +%F)" ]] && return 1
+  local tmp
+  tmp=$(mktemp "$CONFIG.XXXXXX")
+  jq '.scheduleEnabled = true | del(.scheduleOffOn)' "$CONFIG" > "$tmp" && mv "$tmp" "$CONFIG"
+  schedule_sync
+}
+
 schedule_sync() {
   local agents="${NIGHT_VISION_AGENTS_DIR:-$HOME/Library/LaunchAgents}"
   local launchctl="${NIGHT_VISION_LAUNCHCTL:-/bin/launchctl}"
@@ -188,7 +200,8 @@ schedule_sync() {
       -e "s|__MINUTE__|$minute|g" -e "s|__STATE__|$STATE_DIR|g" "$template" > "$tmp"
     mv "$tmp" "$target"
     "$launchctl" bootout "gui/$UID/$label" 2>/dev/null || true
-    if [[ "$(config_value 'if .scheduleEnabled == null then true else .scheduleEnabled end')" == true ]]; then
+    # The day job stays loaded while the schedule is off so it can turn it back on.
+    if [[ "$id" == day ]] || schedule_enabled; then
       "$launchctl" bootstrap "gui/$UID" "$target"
     fi
   done < <(jq -r '.phases[] | [.id, .time] | @tsv' "$CONFIG")
@@ -219,7 +232,8 @@ case "${1:-}" in
     run_phase "$1"
     ;;
   auto)
-    [[ "$(config_value 'if .scheduleEnabled == null then true else .scheduleEnabled end')" == true ]] || exit 0
+    schedule_reenable_if_stale || true
+    schedule_enabled || exit 0
     # The morning transition ends a hold even if it was set after midnight.
     [[ "${2:-}" == day ]] && rm -f "$STATE_DIR/override"
     if is_paused; then exit 0; fi
@@ -228,6 +242,7 @@ case "${1:-}" in
     ;;
   sync) run_phase "$(active_phase)" ;;
   schedule-sync) schedule_sync ;;
+  schedule-check) schedule_reenable_if_stale || true ;;
   away)
     # Keep the first saved level if away is pressed twice. The menu app passes
     # the level from before the key press that started the chord.

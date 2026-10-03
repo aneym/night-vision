@@ -20,7 +20,7 @@ the display's last read brightness and warmth into the selected period's editor;
 **Save** stores that version for future transitions. Editing a period never
 changes the display immediately. The Schedule switch enables or disables all
 automatic phase jobs without changing the current display. Existing configs
-default to enabled; `"scheduleEnabled": false` disables them explicitly.
+default to enabled; `"scheduleEnabled": false` disables them for the day (the app stamps `scheduleOffOn`); the next day the schedule turns itself back on.
 
 Changes are written atomically to `~/.config/night-vision/config.json` while
 retaining other config fields, and the phase launch agents are refreshed without
