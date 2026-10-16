@@ -43,9 +43,8 @@ case "$backend" in
   *) printf 'Unsupported display backend: %s\n' "$backend" >&2; exit 1 ;;
 esac
 
-for file in phase override; do
-  [[ -e "$STATE/$file" ]] || [[ ! -e "$OLD_STATE/$file" ]] || cp "$OLD_STATE/$file" "$STATE/$file"
-done
+[[ -e "$STATE/phase" ]] || [[ ! -e "$OLD_STATE/phase" ]] || cp "$OLD_STATE/phase" "$STATE/phase"
+rm -f "$STATE/override"
 clang -fobjc-arc -framework Foundation -F/System/Library/PrivateFrameworks -framework CoreBrightness \
   "$ROOT/nshift.m" -o "$ROOT/bin/nshift"
 if [[ -f "$ROOT/nvbrightness.m" ]]; then
@@ -67,5 +66,9 @@ launchctl bootout "gui/$UID/$menubar_label" 2>/dev/null || true
 launchctl bootstrap "gui/$UID" "$menubar_target"
 
 pkill -f '/NightVision.app/Contents/MacOS/NightVision' 2>/dev/null || true
+for _ in $(seq 1 20); do
+  pgrep -qf '/NightVision.app/Contents/MacOS/NightVision' || break
+  sleep 0.25
+done
 /usr/bin/open -a "$APP"
 printf 'Night Vision installed from %s\n' "$ROOT"

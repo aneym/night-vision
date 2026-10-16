@@ -1123,6 +1123,12 @@ struct NightVisionApp: App {
     private let keyMonitor: DisplayKeyMonitor
 
     init() {
+        let me = NSRunningApplication.current
+        if let id = Bundle.main.bundleIdentifier,
+           NSRunningApplication.runningApplications(withBundleIdentifier: id)
+               .contains(where: { $0.processIdentifier != me.processIdentifier && !$0.isTerminated }) {
+            exit(0)
+        }
         let model = Model()
         _model = StateObject(wrappedValue: model)
         keyMonitor = DisplayKeyMonitor(model: model)

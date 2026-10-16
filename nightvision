@@ -11,6 +11,8 @@ ROOT="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 CONFIG="${NIGHT_VISION_CONFIG:-$HOME/.config/night-vision/config.json}"
 STATE_DIR="$HOME/.local/state/night-vision"
 NSHIFT="$ROOT/bin/nshift"
+OSASCRIPT="${NIGHT_VISION_OSASCRIPT:-/usr/bin/osascript}"
+DEFAULTS="${NIGHT_VISION_DEFAULTS:-/usr/bin/defaults}"
 DEFAULT_CONFIG='{"display":"ddc","phases":[{"id":"day","title":"Day","symbol":"sun.max.fill","time":"07:00","lum":48,"warmth":0},{"id":"evening","title":"Evening","symbol":"sun.horizon.fill","time":"20:00","lum":32,"warmth":60},{"id":"winddown","title":"Wind-down","symbol":"moon.fill","time":"20:30","lum":18,"warmth":90},{"id":"cutoff","title":"Cutoff","symbol":"moon.zzz.fill","time":"22:15","lum":6,"warmth":100}],"lights":[{"title":"Bedroom On","shortcut":"Bedroom on"},{"title":"Living Room Low","shortcut":"Living room low"},{"title":"Hallway Low","shortcut":"Hallway Low"},{"title":"Bathroom Low","shortcut":"Bathroom low"}]}'
 mkdir -p "$STATE_DIR"
 
@@ -48,15 +50,15 @@ appearance_set() {
 
   # Night Vision owns the appearance schedule; disable macOS's competing
   # sunrise/sunset automation before applying the phase's explicit mode.
-  /usr/bin/defaults write -g AppleInterfaceStyleSwitchesAutomatically -bool false
+  "$DEFAULTS" write -g AppleInterfaceStyleSwitchesAutomatically -bool false
 
   for attempt in 1 2 3; do
-    if /usr/bin/osascript \
+    if "$OSASCRIPT" \
       -e 'tell application "System Events"' \
       -e 'launch' \
       -e "tell appearance preferences to set dark mode to $dark" \
       -e 'end tell' >/dev/null 2>&1; then
-      actual=$(/usr/bin/osascript -e 'tell application "System Events" to get dark mode of appearance preferences' 2>/dev/null || true)
+      actual=$("$OSASCRIPT" -e 'tell application "System Events" to get dark mode of appearance preferences' 2>/dev/null || true)
       [[ "$actual" == "$dark" ]] && return 0
     fi
     /usr/bin/killall 'System Events' >/dev/null 2>&1 || true
@@ -121,8 +123,13 @@ warmth_get() {
 AWAY="$STATE_DIR/away"
 is_away() { [[ -f "$AWAY" ]]; }
 
-is_paused() { [[ -f "$STATE_DIR/override" ]] && [[ "$(<"$STATE_DIR/override")" == "$(date +%F)" ]]; }
-notify() { /usr/bin/osascript -e "display notification \"$2\" with title \"$1\""; }
+PAUSED="$STATE_DIR/paused"
+MANUAL="$STATE_DIR/manual"
+is_paused() { [[ -f "$PAUSED" ]] && [[ "$(<"$PAUSED")" == "$(date +%F)" ]]; }
+mark_manual() { printf '%s %s\n' "$(date +%F)" "$(active_phase)" > "$MANUAL"; }
+manual_in() { [[ -f "$MANUAL" ]] && [[ "$(<"$MANUAL")" == "$(date +%F) $1" ]]; }
+is_manual() { manual_in "$(active_phase)"; }
+notify() { "$OSASCRIPT" -e "display notification \"$2\" with title \"$1\""; }
 
 run_phase() {
   local id="$1" lum warmth title appearance
@@ -135,7 +142,8 @@ run_phase() {
   # While away the screen stays dark; the phase's brightness is what "back" restores.
   if is_away; then printf '%s\n' "$lum" > "$AWAY"; else lum_set "$lum"; fi
   printf '%s\n' "$id" > "$STATE_DIR/phase"
-  [[ "$id" == "day" ]] && rm -f "$STATE_DIR/override"
+  rm -f "$MANUAL"
+  [[ "$id" == "day" ]] && rm -f "$PAUSED"
   # Appearance automation can fail independently (for example, System Events
   # is unavailable). Keep the successfully applied display phase and report it.
   if ! appearance_set "$appearance"; then
@@ -208,36 +216,37 @@ schedule_sync() {
 }
 
 status_json() {
-  local phase paused away lum warmth brightness
+  local phase paused manual schedule away lum warmth brightness
   phase=day
   [[ -f "$STATE_DIR/phase" ]] && phase=$(<"$STATE_DIR/phase")
   if is_paused; then paused=true; else paused=false; fi
+  if is_manual; then manual=true; else manual=false; fi
+  if schedule_enabled; then schedule=true; else schedule=false; fi
   if is_away; then away=true; else away=false; fi
   lum=$(lum_get || phase_value "$phase" lum)
   warmth=$(warmth_get || phase_value "$phase" warmth)
   if [[ -x "$ROOT/bin/nvbrightness" ]] && brightness=$("$ROOT/bin/nvbrightness" status 2>/dev/null); then
-    jq -nc --arg phase "$phase" --argjson paused "$paused" --argjson lum "${lum:-0}" \
-      --argjson warmth "${warmth:-0}" --argjson brightness "$brightness" --argjson away "$away" \
-      '{phase:$phase,paused:$paused,away:$away,lum:$lum,warmth:$warmth,brightness:$brightness}'
+    jq -nc --arg phase "$phase" --argjson paused "$paused" --argjson manual "$manual" --argjson schedule "$schedule" \
+      --argjson lum "${lum:-0}" --argjson warmth "${warmth:-0}" --argjson brightness "$brightness" --argjson away "$away" \
+      '{phase:$phase,schedule:$schedule,paused:$paused,manual:$manual,away:$away,lum:$lum,warmth:$warmth,brightness:$brightness}'
   else
-    jq -nc --arg phase "$phase" --argjson paused "$paused" --argjson away "$away" --argjson lum "${lum:-0}" --argjson warmth "${warmth:-0}" \
-      '{phase:$phase,paused:$paused,away:$away,lum:$lum,warmth:$warmth}'
+    jq -nc --arg phase "$phase" --argjson paused "$paused" --argjson manual "$manual" --argjson schedule "$schedule" \
+      --argjson away "$away" --argjson lum "${lum:-0}" --argjson warmth "${warmth:-0}" \
+      '{phase:$phase,schedule:$schedule,paused:$paused,manual:$manual,away:$away,lum:$lum,warmth:$warmth}'
   fi
 }
 
 case "${1:-}" in
   day|evening|winddown|cutoff)
-    # Explicit phase pick puts the schedule back in charge after a manual hold.
-    rm -f "$STATE_DIR/override"
+    rm -f "$PAUSED"
     run_phase "$1"
     ;;
   auto)
     schedule_reenable_if_stale || true
     schedule_enabled || exit 0
-    # The morning transition ends a hold even if it was set after midnight.
-    [[ "${2:-}" == day ]] && rm -f "$STATE_DIR/override"
+    [[ "${2:-}" == day ]] && rm -f "$PAUSED"
     if is_paused; then exit 0; fi
-    [[ -f "$STATE_DIR/override" ]] && rm -f "$STATE_DIR/override"
+    if manual_in "${2:-}"; then exit 0; fi
     run_phase "${2:-}"
     ;;
   sync) run_phase "$(active_phase)" ;;
@@ -270,21 +279,20 @@ case "${1:-}" in
     # A hand-set brightness ends away; the menu app drops its blackout.
     rm -f "$AWAY"
     lum_set "${2:?brightness required}"
-    # Manual adjustment holds the schedule until tomorrow's day phase, so
-    # launchd phase jobs stop clobbering a hand-set brightness.
-    date +%F > "$STATE_DIR/override"
+    mark_manual
     ;;
   temp)
     warmth_set "${2:?warmth required}"
-    date +%F > "$STATE_DIR/override"
+    mark_manual
     ;;
-  pause) date +%F > "$STATE_DIR/override"; notify "Night Vision paused" "Automation resumes tomorrow morning." ;;
-  resume) rm -f "$STATE_DIR/override"; run_phase "$(active_phase)" ;;
+  pause) date +%F > "$PAUSED"; notify "Night Vision paused" "Automation resumes tomorrow morning." ;;
+  resume) rm -f "$PAUSED"; run_phase "$(active_phase)" ;;
   status)
     json=$(status_json)
     printf 'phase: %s\n' "$(jq -r .phase <<<"$json")"
+    printf 'schedule: %s\n' "$(jq -r 'if .schedule | not then "off" elif .paused then "paused until tomorrow" else "on" end' <<<"$json")"
+    printf 'manual: %s\n' "$(jq -r 'if .manual then "yes, until the next phase" else "no" end' <<<"$json")"
     printf 'away: %s\n' "$(jq -r 'if .away then "yes" else "no" end' <<<"$json")"
-    printf 'override: %s\n' "$(jq -r 'if .paused then "yes" else "no" end' <<<"$json")"
     printf 'enabled=%s strength=%s\n' "$(jq -r 'if .warmth > 0 then "yes" else "no" end' <<<"$json")" "$(jq -r .warmth <<<"$json")"
     printf 'luminance: %s\n' "$(jq -r .lum <<<"$json")"
     ;;

@@ -28,6 +28,11 @@ reinstalling or rebuilding. For config edits made outside the app, run
 `nightvision schedule-sync` to refresh their launchd times. Manual presets still
 work while the schedule is off.
 
+Adjusting brightness or warmth (sliders, display keys, `lum`, `temp`) changes
+only the current state. The schedule stays on: the adjustment lasts until the
+next phase starts, and that phase applies its own values as usual. **Pause
+tonight** and the Schedule switch are the only ways to stop the schedule.
+
 ## Expanded brightness on built-in XDR displays
 
 For the `internal` backend, Night Vision maps its existing 0-100 control across
@@ -65,8 +70,8 @@ The menu bar app installs a session event tap for the top-row display keys:
 | `Shift-F1` / `Shift-F2` | Warmth down / up, 20% per press |
 | `F1` + `F2` together, or `Option-F1` | Away: screen fully dark; any brightness key returns |
 
-Both values clamp to 0-100. A press counts as a manual adjustment, so it holds
-the schedule for the rest of the day the same way `lum`/`temp` do. Chords with
+Both values clamp to 0-100. A press counts as a manual adjustment, so it lasts
+until the next phase starts, the same way `lum`/`temp` do. Chords with
 Command or Control pass straight through to the focused app.
 
 Step sizes are configurable without a rebuild:
@@ -123,7 +128,7 @@ If the config is absent or invalid, the CLI and app use the built-in Studio phas
 
 Each phase may set `"appearance": "light"` or `"appearance": "dark"`. Applying a phase disables macOS's competing automatic appearance schedule, applies that appearance, and verifies the resulting System Events state. For backward compatibility, a phase without this field uses Light for `day` and Dark for every other phase.
 
-A manual `lum` or `temp` adjustment (the app's granular sliders and display-key controls use these) holds the schedule for the rest of the day, the same override "pause" uses, so phase jobs stop re-adjusting a hand-set brightness. The schedule resumes at the next morning day phase, or immediately when you pick a phase preset or run `resume`.
+A manual `lum` or `temp` adjustment (the app's sliders and display keys use these) records the active phase in `manual`. A repeat run of that same phase on the same day leaves the hand-set values alone; the next phase applies normally and clears the record. `pause` skips the rest of today's phases until the next day phase, and `resume` or picking a phase preset ends it.
 
 ## Display keys
 
