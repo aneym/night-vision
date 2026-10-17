@@ -55,7 +55,7 @@ let FALLBACK_CONFIG = NightVisionConfig(
         .init(title: "Hallway Low", shortcut: "Hallway Low"),
         .init(title: "Bathroom Low", shortcut: "Bathroom low"),
     ],
-    keySteps: .init(brightness: 5, warmth: 20),
+    keySteps: .init(brightness: 3, warmth: 20),
     scheduleEnabled: true,
     scheduleOffOn: nil
 )
@@ -876,7 +876,7 @@ final class DisplayKeyMonitor {
     // Brightness is instant, so small steps feel precise. Night Shift ramps its
     // color change over about a second, so warmth needs coarser steps to feel
     // responsive. Both are overridable via "keySteps" in config.json.
-    private let brightnessStep = max(1, CONFIG.keySteps?.brightness ?? 5)
+    private let brightnessStep = max(1, CONFIG.keySteps?.brightness ?? 3)
     private let warmthStep = max(1, CONFIG.keySteps?.warmth ?? 20)
     private let model: Model
 

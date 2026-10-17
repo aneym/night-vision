@@ -66,7 +66,7 @@ The menu bar app installs a session event tap for the top-row display keys:
 
 | Key | Effect |
 | --- | --- |
-| `F1` / `F2` | Brightness down / up, 5% per press |
+| `F1` / `F2` | Brightness down / up, 3% per press |
 | `Shift-F1` / `Shift-F2` | Warmth down / up, 20% per press |
 | `F1` + `F2` together, or `Option-F1` | Away: screen fully dark; any brightness key returns |
 
@@ -77,7 +77,7 @@ Command or Control pass straight through to the focused app.
 Step sizes are configurable without a rebuild:
 
 ```json
-"keySteps": { "brightness": 5, "warmth": 20 }
+"keySteps": { "brightness": 3, "warmth": 20 }
 ```
 
 Brightness is instant over DDC, so small steps feel precise. Night Shift ramps
@@ -134,9 +134,9 @@ A manual `lum` or `temp` adjustment (the app's sliders and display keys use thes
 
 While the menu-bar app runs, it owns the display brightness keys globally:
 
-- F1: brightness down 5 points
-- F2: brightness up 5 points
-- Shift-F1: warmth down 10 points
-- Shift-F2: warmth up 10 points
+- F1: brightness down 3 points
+- F2: brightness up 3 points
+- Shift-F1: warmth down 20 points
+- Shift-F2: warmth up 20 points
 
 Values clamp to 0...100. macOS may ask once for Accessibility permission so Night Vision can intercept these keys.
