@@ -183,7 +183,9 @@ schedule_sync() {
   local launchctl="${NIGHT_VISION_LAUNCHCTL:-/bin/launchctl}"
   local template="$ROOT/launchd/phase.plist.template"
   local cli="${NIGHT_VISION_CLI:-$HOME/.local/bin/nightvision}"
-  local id time hour minute label target tmp
+  local id time hour minute label target tmp anchor=
+  local bun="$HOME/.bun/bin/bun" ext_run="$HOME/.local/bin/ext-run.js"
+  [[ -x "$bun" && -f "$ext_run" ]] && anchor="<string>$bun</string><string>$ext_run</string>"
   [[ -f "$CONFIG" && -f "$template" ]] || { printf 'Missing schedule config or template\n' >&2; return 1; }
   if [[ -z "${NIGHT_VISION_CLI:-}" ]]; then
     local resolved_cli
@@ -205,7 +207,7 @@ schedule_sync() {
     target="$agents/$label.plist"
     tmp=$(mktemp "$target.XXXXXX")
     sed -e "s|__PHASE__|$id|g" -e "s|__CLI__|$cli|g" -e "s|__HOUR__|$hour|g" \
-      -e "s|__MINUTE__|$minute|g" -e "s|__STATE__|$STATE_DIR|g" "$template" > "$tmp"
+      -e "s|__MINUTE__|$minute|g" -e "s|__STATE__|$STATE_DIR|g" -e "s|__ANCHOR__|$anchor|g" "$template" > "$tmp"
     mv "$tmp" "$target"
     "$launchctl" bootout "gui/$UID/$label" 2>/dev/null || true
     # The day job stays loaded while the schedule is off so it can turn it back on.
