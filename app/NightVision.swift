@@ -976,6 +976,11 @@ final class DisplayKeyMonitor {
 
         guard let eventTap else {
             Self.log("tapCreate failed — Accessibility not granted for this build; retrying")
+            // Ask macOS to surface the Accessibility prompt for this build.
+            // A stale TCC entry pinned to an old binary's cdhash never matches
+            // a rebuild, so without the prompt the keys stay dead silently.
+            let prompt = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary
+            _ = AXIsProcessTrustedWithOptions(prompt)
             scheduleRetry()
             return
         }
