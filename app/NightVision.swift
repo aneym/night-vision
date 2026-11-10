@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import CoreGraphics
+import Carbon.HIToolbox
 
 // MARK: - Paths & phase model
 
@@ -914,17 +915,30 @@ final class DisplayKeyMonitor {
     /// a lost key-up cannot leave a stale hold that turns a later press into a chord.
     private static let holdLimit: TimeInterval = 2.5
 
+    private static let hotKeySignature: OSType = 0x4E56_484B
+    private static let hotKeyCodes: [Int64] = [vkF1, vkF2, vkF14, vkF15]
+    private static let hotKeyModifiers: [UInt32] = [0, UInt32(shiftKey), UInt32(optionKey), UInt32(shiftKey | optionKey)]
+    private static let repeatLimit: TimeInterval = 6
+
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var retryTimer: Timer?
+    private var hotKeyRefs: [EventHotKeyRef] = []
+    private var hotKeyHandler: EventHandlerRef?
+    private var hotKeysLive = false
+    private var repeatTimers: [Bool: Timer] = [:]
 
     init(model: Model) {
         self.model = model
+        hotKeysLive = installHotKeys()
+        Self.isLive = hotKeysLive
         install()
     }
 
     deinit {
         retryTimer?.invalidate()
+        repeatTimers.values.forEach { $0.invalidate() }
+        removeHotKeys()
         if let eventTap { CGEvent.tapEnable(tap: eventTap, enable: false) }
         if let runLoopSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), runLoopSource, .commonModes) }
     }
@@ -953,9 +967,98 @@ final class DisplayKeyMonitor {
 
     // MARK: Install
 
+    private func installHotKeys() -> Bool {
+        var types = [
+            EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed)),
+            EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyReleased)),
+        ]
+        let context = Unmanaged.passUnretained(self).toOpaque()
+        let status = InstallEventHandler(
+            GetApplicationEventTarget(),
+            { _, event, context in
+                guard let event, let context else { return OSStatus(eventNotHandledErr) }
+                let monitor = Unmanaged<DisplayKeyMonitor>.fromOpaque(context).takeUnretainedValue()
+                return monitor.handleHotKey(event)
+            },
+            types.count, &types, context, &hotKeyHandler
+        )
+        guard status == noErr else {
+            Self.log("hot key handler failed: \(status)")
+            return false
+        }
+        var index: UInt32 = 0
+        for code in Self.hotKeyCodes {
+            for modifiers in Self.hotKeyModifiers {
+                var ref: EventHotKeyRef?
+                let id = EventHotKeyID(signature: Self.hotKeySignature, id: index)
+                let result = RegisterEventHotKey(UInt32(code), modifiers, id, GetApplicationEventTarget(), 0, &ref)
+                guard result == noErr, let ref else {
+                    Self.log("hot key \(code) modifiers=\(modifiers) failed: \(result); using the event tap")
+                    removeHotKeys()
+                    return false
+                }
+                hotKeyRefs.append(ref)
+                index += 1
+            }
+        }
+        Self.log("hot keys registered")
+        return true
+    }
+
+    private func removeHotKeys() {
+        hotKeyRefs.forEach { UnregisterEventHotKey($0) }
+        hotKeyRefs.removeAll()
+        if let hotKeyHandler { RemoveEventHandler(hotKeyHandler) }
+        hotKeyHandler = nil
+    }
+
+    private func handleHotKey(_ event: EventRef) -> OSStatus {
+        var id = EventHotKeyID()
+        let status = GetEventParameter(
+            event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
+            nil, MemoryLayout<EventHotKeyID>.size, nil, &id)
+        let count = Self.hotKeyModifiers.count
+        guard status == noErr, id.signature == Self.hotKeySignature, Int(id.id) < Self.hotKeyCodes.count * count else {
+            return OSStatus(eventNotHandledErr)
+        }
+        let code = Self.hotKeyCodes[Int(id.id) / count]
+        let modifiers = Self.hotKeyModifiers[Int(id.id) % count]
+        let up = Self.upKeys.contains(code)
+        if GetEventKind(event) == UInt32(kEventHotKeyReleased) {
+            repeatTimers[up]?.invalidate()
+            repeatTimers[up] = nil
+            held[up] = nil
+            return noErr
+        }
+        let shift = modifiers & UInt32(shiftKey) != 0
+        let option = modifiers & UInt32(optionKey) != 0
+        Self.log("hotkey code=\(code) shift=\(shift) option=\(option)")
+        press(up: up, isRepeat: false, shift: shift, option: option)
+        startRepeat(up: up, shift: shift, option: option)
+        return noErr
+    }
+
+    private func startRepeat(up: Bool, shift: Bool, option: Bool) {
+        repeatTimers[up]?.invalidate()
+        let started = Date()
+        let timer = Timer(
+            fire: started.addingTimeInterval(NSEvent.keyRepeatDelay),
+            interval: NSEvent.keyRepeatInterval,
+            repeats: true
+        ) { [weak self] timer in
+            guard let self else { return timer.invalidate() }
+            guard Date().timeIntervalSince(started) < Self.repeatLimit else {
+                timer.invalidate()
+                self.repeatTimers[up] = nil
+                return
+            }
+            self.press(up: up, isRepeat: true, shift: shift, option: option)
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        repeatTimers[up] = timer
+    }
+
     private func install() {
-        // Third-party keyboards send a plain F1/F2 keyDown; Apple keyboards send
-        // an NSSystemDefined brightness event. Tap both so either hardware works.
         let mask = (CGEventMask(1) << CGEventType.keyDown.rawValue)
             | (CGEventMask(1) << CGEventType.keyUp.rawValue)
             | (CGEventMask(1) << Self.systemDefined.rawValue)
@@ -975,6 +1078,11 @@ final class DisplayKeyMonitor {
         )
 
         guard let eventTap else {
+            if hotKeysLive {
+                Self.log("event tap unavailable without Accessibility; function keys run on hot keys")
+                scheduleRetry()
+                return
+            }
             Self.log("tapCreate failed — Accessibility not granted for this build; retrying")
             // Ask macOS to surface the Accessibility prompt for this build.
             // A stale TCC entry pinned to an old binary's cdhash never matches
@@ -987,6 +1095,12 @@ final class DisplayKeyMonitor {
 
         retryTimer?.invalidate()
         retryTimer = nil
+        if hotKeysLive {
+            repeatTimers.values.forEach { $0.invalidate() }
+            repeatTimers.removeAll()
+            removeHotKeys()
+            hotKeysLive = false
+        }
         runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, eventTap, 0)
         if let runLoopSource { CFRunLoopAddSource(CFRunLoopGetMain(), runLoopSource, .commonModes) }
         CGEvent.tapEnable(tap: eventTap, enable: true)
