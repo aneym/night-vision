@@ -20,7 +20,22 @@ swiftc -O -parse-as-library -target arm64-apple-macos26.0 \
 # background (ssh/agent) session the login keychain refuses the key with
 # errSecInternalComponent; run the build from a GUI Terminal, or run this
 # codesign line through a one-shot launch agent in gui/$UID.
-IDENTITY="${NIGHT_VISION_SIGN_IDENTITY:-$(security find-identity -v -p codesigning 2>/dev/null | awk -F'"' '/Apple Development:/ {print $2; exit}')}"
+valid_dev_identity() {
+  local pem hash
+  pem="$(mktemp)"
+  for hash in $(security find-identity -v -p codesigning 2>/dev/null | awk '/"Apple Development:/ {print $2}'); do
+    security find-certificate -a -Z -p 2>/dev/null \
+      | awk -v h="$hash" '/^SHA-1 hash:/ {k = ($3 == h)} k && /BEGIN CERT/ {p = 1} p && k {print} /END CERT/ {p = 0}' > "$pem"
+    if [[ -s "$pem" ]] && security verify-cert -q -c "$pem" -p codeSign -R ocsp > /dev/null 2>&1; then
+      rm -f "$pem"
+      echo "$hash"
+      return 0
+    fi
+  done
+  rm -f "$pem"
+  return 1
+}
+IDENTITY="${NIGHT_VISION_SIGN_IDENTITY:-$(valid_dev_identity || true)}"
 if [[ -n "$IDENTITY" ]] && codesign --force --options runtime --sign "$IDENTITY" "$APP" 2>/dev/null; then
   echo "Built $PWD/$APP (signed: $IDENTITY)"
 else
